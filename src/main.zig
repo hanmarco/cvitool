@@ -18,6 +18,9 @@ const CompressOptions = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    if (@import("builtin").os.tag == .windows) {
+        _ = std.os.windows.kernel32.SetConsoleOutputCP(65001);
+    }
     const arena = init.arena.allocator();
     const io = init.io;
 
