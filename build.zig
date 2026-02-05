@@ -1,4 +1,5 @@
 const std = @import("std");
+const Io = std.Io;
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
@@ -7,6 +8,8 @@ const std = @import("std");
 // build runner to parallelize the build automatically (and the cache system to
 // know when a step doesn't need to be re-run).
 pub fn build(b: *std.Build) void {
+    const version = resolveVersion(b);
+    const exe_version = std.SemanticVersion.parse(version) catch null;
     // Standard target options allow the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
@@ -59,6 +62,7 @@ pub fn build(b: *std.Build) void {
     // don't need and to put everything under a single module.
     const exe = b.addExecutable(.{
         .name = "cvitool",
+        .version = exe_version,
         .root_module = b.createModule(.{
             // b.createModule defines a new module just like b.addModule but,
             // unlike b.addModule, it does not expose the module to consumers of
@@ -82,6 +86,10 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+    exe.root_module.addOptions("build_options", build_options);
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
@@ -153,4 +161,42 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+fn resolveVersion(b: *std.Build) []const u8 {
+    if (b.option([]const u8, "version", "Override version string")) |override| {
+        return override;
+    }
+    return readZonVersion(b) orelse "0.0.0";
+}
+
+fn readZonVersion(b: *std.Build) ?[]const u8 {
+    const io = b.graph.io;
+    const file = Io.Dir.cwd().openFile(io, "build.zig.zon", .{}) catch {
+        return null;
+    };
+    defer file.close(io);
+
+    var buffer: [2048]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    const content = reader.interface.allocRemaining(b.allocator, .unlimited) catch {
+        return null;
+    };
+
+    return parseZonVersion(content);
+}
+
+fn parseZonVersion(content: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (!std.mem.startsWith(u8, line, ".version")) continue;
+        if (line.len < ".version".len) continue;
+        const rest = line[".version".len..];
+        const quote_start = std.mem.indexOfScalar(u8, rest, '"') orelse continue;
+        const after_quote = rest[quote_start + 1 ..];
+        const quote_end = std.mem.indexOfScalar(u8, after_quote, '"') orelse continue;
+        return after_quote[0..quote_end];
+    }
+    return null;
 }

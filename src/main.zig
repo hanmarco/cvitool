@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const mem = std.mem;
 const ascii = std.ascii;
+const build_options = @import("build_options");
 
 const DefaultExts = [_][]const u8{
     ".dll",
@@ -47,6 +48,11 @@ pub fn main(init: std.process.Init) !void {
     const cmd = args[1];
     if (isHelp(cmd)) {
         try printHelp(stdout);
+        try stdout.flush();
+        return;
+    }
+    if (isVersion(cmd)) {
+        try stdout.print("cvitool {s}\n", .{build_options.version});
         try stdout.flush();
         return;
     }
@@ -122,6 +128,7 @@ fn printHelp(writer: *Io.Writer) !void {
         \\  cvitool build
         \\  cvitool compress [path] [--ext <list>] [--folder <dir>] [--out <file.zip>]
         \\  cvitool upload target.zip targeturl
+        \\  cvitool version
         \\  cvitool help
         \\
         \\compress 기본값:
@@ -144,6 +151,10 @@ fn printHelp(writer: *Io.Writer) !void {
 
 fn isHelp(arg: []const u8) bool {
     return mem.eql(u8, arg, "help") or mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help");
+}
+
+fn isVersion(arg: []const u8) bool {
+    return mem.eql(u8, arg, "version") or mem.eql(u8, arg, "--version") or mem.eql(u8, arg, "-V");
 }
 
 fn isValidVersion(version: []const u8) bool {
