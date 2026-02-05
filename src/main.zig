@@ -13,8 +13,13 @@ const DefaultExts = [_][]const u8{
 const CompressOptions = struct {
     path: []const u8,
     exts: [][]const u8,
-    include_dir: ?[]const u8,
+    include_dirs: []IncludeDir,
     out: ?[]const u8,
+};
+
+const IncludeDir = struct {
+    path: []const u8,
+    required: bool,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -122,7 +127,8 @@ fn printHelp(writer: *Io.Writer) !void {
         \\compress 기본값:
         \\  path: src
         \\  ext:  *.dll *.uir *.exe *.ini
-        \\  folder: 없음 (루트 폴더를 포함하지 않음)
+        \\  folder: 없음 (루트 폴더를 포함하지 않음, 여러 개 가능)
+        \\  path를 지정하고 folder를 생략하면 res 폴더를 기본 포함 (존재할 때)
         \\  out: <시간>_<폴더이름>.zip
         \\
         \\예시:
@@ -260,7 +266,7 @@ fn runCompile(io: Io, stderr: *Io.Writer, prj_path: []const u8) !void {
 
 fn parseCompressArgs(allocator: std.mem.Allocator, args: []const []const u8) !CompressOptions {
     var path_value: []const u8 = "src";
-    var include_dir: ?[]const u8 = null;
+    var include_dirs: std.ArrayList(IncludeDir) = .empty;
     var out_path: ?[]const u8 = null;
 
     var exts_list: std.ArrayList([]const u8) = .empty;
@@ -292,7 +298,7 @@ fn parseCompressArgs(allocator: std.mem.Allocator, args: []const []const u8) !Co
         if (mem.eql(u8, arg, "--folder") or mem.eql(u8, arg, "--include-dir") or mem.eql(u8, arg, "-d")) {
             i += 1;
             if (i >= args.len) return error.InvalidArgs;
-            include_dir = args[i];
+            try parseFolderList(allocator, args[i], &include_dirs);
             continue;
         }
         if (mem.eql(u8, arg, "--out") or mem.eql(u8, arg, "-o")) {
@@ -311,10 +317,14 @@ fn parseCompressArgs(allocator: std.mem.Allocator, args: []const []const u8) !Co
         return error.InvalidArgs;
     }
 
+    if (path_set and include_dirs.items.len == 0) {
+        try include_dirs.append(allocator, .{ .path = "res", .required = false });
+    }
+
     return .{
         .path = path_value,
         .exts = exts_list.items,
-        .include_dir = include_dir,
+        .include_dirs = include_dirs.items,
         .out = out_path,
     };
 }
@@ -334,24 +344,76 @@ fn parseExtList(allocator: std.mem.Allocator, raw: []const u8, list: *std.ArrayL
     }
 }
 
-fn runCompress(io: Io, allocator: std.mem.Allocator, stderr: *Io.Writer, options: CompressOptions) ![]const u8 {
-    const search_root = try resolveSearchRoot(allocator, options.path, options.include_dir);
-    const include_prefix = if (options.include_dir != null) Io.Dir.path.basename(search_root) else null;
-    const base_dir = if (include_prefix != null) (Io.Dir.path.dirname(search_root) orelse ".") else search_root;
+fn parseFolderList(allocator: std.mem.Allocator, raw: []const u8, list: *std.ArrayList(IncludeDir)) !void {
+    var it = mem.tokenizeAny(u8, raw, ",; \t");
+    while (it.next()) |token| {
+        if (token.len == 0) continue;
+        try list.append(allocator, .{ .path = token, .required = true });
+    }
+}
 
-    const files = collectFiles(io, allocator, search_root, include_prefix, options.exts) catch |err| switch (err) {
-        error.FileNotFound => fatal(stderr, "경로를 찾지 못했습니다: {s}", .{search_root}),
-        error.NotDir => fatal(stderr, "폴더가 아닙니다: {s}", .{search_root}),
+fn runCompress(io: Io, allocator: std.mem.Allocator, stderr: *Io.Writer, options: CompressOptions) ![]const u8 {
+    const base_dir = options.path;
+    var files: std.ArrayList([]const u8) = .empty;
+    defer files.deinit(allocator);
+
+    var include_entries: std.ArrayList(IncludeEntry) = .empty;
+    defer include_entries.deinit(allocator);
+
+    var exclude_prefixes: std.ArrayList([]const u8) = .empty;
+    defer exclude_prefixes.deinit(allocator);
+
+    var seen_prefixes: std.StringHashMap(void) = .init(allocator);
+    defer seen_prefixes.deinit();
+
+    for (options.include_dirs) |dir_spec| {
+        const dir_raw = dir_spec.path;
+        if (Io.Dir.path.isAbsolute(dir_raw)) {
+            if (dir_spec.required) {
+                fatal(stderr, "--folder는 path 기준의 상대 경로만 지원합니다: {s}", .{dir_raw});
+            }
+            continue;
+        }
+
+        const dir_norm = try normalizeSeparators(allocator, dir_raw);
+        if (dir_norm.len == 0) continue;
+        if (seen_prefixes.contains(dir_norm)) continue;
+        try seen_prefixes.put(dir_norm, {});
+
+        const root = try Io.Dir.path.join(allocator, &.{ base_dir, dir_norm });
+        const exists = dirExists(io, root) catch |err| switch (err) {
+            else => return err,
+        };
+        if (exists) {
+            try include_entries.append(allocator, .{ .root = root, .prefix = dir_norm });
+            try exclude_prefixes.append(allocator, dir_norm);
+        } else if (dir_spec.required) {
+            fatal(stderr, "폴더를 찾지 못했습니다: {s}", .{root});
+        }
+    }
+
+    collectFilesInto(io, allocator, base_dir, null, options.exts, exclude_prefixes.items, &files) catch |err| switch (err) {
+        error.FileNotFound => fatal(stderr, "경로를 찾지 못했습니다: {s}", .{base_dir}),
+        error.NotDir => fatal(stderr, "폴더가 아닙니다: {s}", .{base_dir}),
         else => return err,
     };
-    if (files.len == 0) {
+
+    for (include_entries.items) |entry| {
+        collectFilesInto(io, allocator, entry.root, entry.prefix, null, &.{}, &files) catch |err| switch (err) {
+            error.FileNotFound => fatal(stderr, "폴더를 찾지 못했습니다: {s}", .{entry.root}),
+            error.NotDir => fatal(stderr, "폴더가 아닙니다: {s}", .{entry.root}),
+            else => return err,
+        };
+    }
+
+    if (files.items.len == 0) {
         fatal(stderr, "압축할 파일을 찾지 못했습니다.", .{});
     }
 
-    const out_path = options.out orelse try defaultZipName(allocator, io, search_root);
+    const out_path = options.out orelse try defaultZipName(allocator, io, base_dir);
     const out_path_abs = try toAbsolutePath(allocator, out_path);
 
-    const tar_ok = runTarZip(io, allocator, out_path_abs, base_dir, files) catch |err| switch (err) {
+    const tar_ok = runTarZip(io, allocator, out_path_abs, base_dir, files.items) catch |err| switch (err) {
         error.CommandFailed => fatal(stderr, "tar 압축 실행에 실패했습니다.", .{}),
         else => return err,
     };
@@ -359,28 +421,27 @@ fn runCompress(io: Io, allocator: std.mem.Allocator, stderr: *Io.Writer, options
         return out_path;
     }
 
-    runPowerShellZip(io, allocator, out_path_abs, base_dir, files) catch |err| switch (err) {
+    runPowerShellZip(io, allocator, out_path_abs, base_dir, files.items) catch |err| switch (err) {
         error.CommandFailed => fatal(stderr, "Compress-Archive 실행에 실패했습니다.", .{}),
         else => return err,
     };
     return out_path;
 }
 
-fn resolveSearchRoot(allocator: std.mem.Allocator, base_path: []const u8, include_dir: ?[]const u8) ![]const u8 {
-    if (include_dir) |dir| {
-        if (Io.Dir.path.isAbsolute(dir)) return dir;
-        return try Io.Dir.path.join(allocator, &.{ base_path, dir });
-    }
-    return base_path;
-}
+const IncludeEntry = struct {
+    root: []const u8,
+    prefix: []const u8,
+};
 
-fn collectFiles(
+fn collectFilesInto(
     io: Io,
     allocator: std.mem.Allocator,
     search_root: []const u8,
     include_prefix: ?[]const u8,
-    exts: [][]const u8,
-) ![][]const u8 {
+    exts: ?[][]const u8,
+    exclude_prefixes: []const []const u8,
+    out: *std.ArrayList([]const u8),
+) !void {
     var dir = if (Io.Dir.path.isAbsolute(search_root))
         try Io.Dir.openDirAbsolute(io, search_root, .{ .iterate = true })
     else
@@ -390,21 +451,24 @@ fn collectFiles(
     var walker = try Io.Dir.walk(dir, allocator);
     defer walker.deinit();
 
-    var list: std.ArrayList([]const u8) = .empty;
-
-    while (try walker.next(io)) |entry| {
+    walk: while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        if (!extMatches(entry.path, exts)) continue;
+        if (exclude_prefixes.len != 0) {
+            for (exclude_prefixes) |prefix| {
+                if (isUnderDir(entry.path, prefix)) continue :walk;
+            }
+        }
+        if (exts) |filter_exts| {
+            if (!extMatches(entry.path, filter_exts)) continue;
+        }
 
         if (include_prefix) |prefix| {
             const rel = try Io.Dir.path.join(allocator, &.{ prefix, entry.path });
-            try list.append(allocator, rel);
+            try out.append(allocator, rel);
         } else {
-            try list.append(allocator, try allocator.dupe(u8, entry.path));
+            try out.append(allocator, try allocator.dupe(u8, entry.path));
         }
     }
-
-    return list.items;
 }
 
 fn extMatches(path_value: []const u8, exts: [][]const u8) bool {
@@ -414,6 +478,12 @@ fn extMatches(path_value: []const u8, exts: [][]const u8) bool {
         if (ascii.eqlIgnoreCase(ext, want)) return true;
     }
     return false;
+}
+
+fn isUnderDir(path_value: []const u8, dir_value: []const u8) bool {
+    if (!mem.startsWith(u8, path_value, dir_value)) return false;
+    if (path_value.len == dir_value.len) return true;
+    return path_value[dir_value.len] == Io.Dir.path.sep;
 }
 
 fn defaultZipName(allocator: std.mem.Allocator, io: Io, search_root: []const u8) ![]const u8 {
@@ -427,6 +497,41 @@ fn toAbsolutePath(allocator: std.mem.Allocator, path_value: []const u8) ![]const
     if (Io.Dir.path.isAbsolute(path_value)) return path_value;
     const cwd = try std.process.getCwdAlloc(allocator);
     return try Io.Dir.path.join(allocator, &.{ cwd, path_value });
+}
+
+fn normalizeSeparators(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+    const sep = Io.Dir.path.sep;
+    var needs = false;
+    for (value) |c| {
+        if ((c == '/' or c == '\\') and c != sep) {
+            needs = true;
+            break;
+        }
+    }
+    if (!needs) return value;
+    var out: std.ArrayList(u8) = .empty;
+    for (value) |c| {
+        if (c == '/' or c == '\\') {
+            try out.append(allocator, sep);
+        } else {
+            try out.append(allocator, c);
+        }
+    }
+    return out.items;
+}
+
+fn dirExists(io: Io, path_value: []const u8) !bool {
+    const dir = if (Io.Dir.path.isAbsolute(path_value))
+        Io.Dir.openDirAbsolute(io, path_value, .{})
+    else
+        Io.Dir.cwd().openDir(io, path_value, .{});
+    return if (dir) |d| blk: {
+        d.close(io);
+        break :blk true;
+    } else |err| switch (err) {
+        error.FileNotFound, error.NotDir => false,
+        else => return err,
+    };
 }
 
 fn formatUtcTimestamp(allocator: std.mem.Allocator, io: Io) ![]const u8 {
