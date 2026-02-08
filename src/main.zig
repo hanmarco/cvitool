@@ -4,6 +4,9 @@ const mem = std.mem;
 const ascii = std.ascii;
 const build_options = @import("build_options");
 
+const Developer = "sss.han@samsung.com";
+const Repo = "github.samsungds.net/sss-han/cvitool";
+
 const DefaultExts = [_][]const u8{
     ".dll",
     ".uir",
@@ -53,6 +56,8 @@ pub fn main(init: std.process.Init) !void {
     }
     if (isVersion(cmd)) {
         try stdout.print("cvitool {s}\n", .{build_options.version});
+        try stdout.print("Developer: {s}\n", .{Developer});
+        try stdout.print("Repository: {s}\n", .{Repo});
         try stdout.flush();
         return;
     }
@@ -121,6 +126,9 @@ pub fn main(init: std.process.Init) !void {
 fn printHelp(writer: *Io.Writer) !void {
     try writer.writeAll(
         \\cvitool - LabWindows/CVI 프로젝트용 CLI
+        \\
+        \\Developer: sss.han@samsung.com
+        \\Repository: github.samsungds.net/sss-han/cvitool
         \\
         \\사용법:
         \\  cvitool bump 1.2.3.4
