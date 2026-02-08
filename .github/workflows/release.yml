@@ -1,0 +1,41 @@
+name: release-windows
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: [self-hosted, windows]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure Zig
+        shell: powershell
+        run: |
+          if (-not (Get-Command zig -ErrorAction SilentlyContinue)) {
+            Write-Error "zig not found on PATH. Install Zig on the self-hosted runner."
+            exit 1
+          }
+          zig version
+
+      - name: Build
+        shell: powershell
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Prepare artifact
+        shell: powershell
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $out = "cvitool-$tag-windows.exe"
+          Copy-Item "zig-out\\bin\\cvitool.exe" $out
+          "ARTIFACT=$out" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ARTIFACT }}
