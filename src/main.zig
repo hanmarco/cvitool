@@ -6,6 +6,9 @@ const build_options = @import("build_options");
 
 const Developer = "sss.han@samsung.com";
 const Repo = "github.samsungds.net/sss-han/cvitool";
+const RuntimeUrl = "https://download.ni.com/support/softlib/labwindows/cvi/Run-Time%20Engines/2013/NILWCVIRTE2013.zip";
+const RuntimeZip = "NILWCVIRTE2013.zip";
+const RuntimeFolder = "NILWCVIRTE2013";
 
 const DefaultExts = [_][]const u8{
     ".dll",
@@ -120,6 +123,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (mem.eql(u8, cmd, "runtime")) {
+        const dest = try runRuntime(io, arena, stderr);
+        try stdout.print("런타임 다운로드 완료: {s}\n", .{RuntimeZip});
+        try stdout.print("압축 위치: {s}\n", .{dest});
+        try stdout.flush();
+        return;
+    }
+
     fatal(stderr, "알 수 없는 명령입니다: {s}", .{cmd});
 }
 
@@ -136,6 +147,7 @@ fn printHelp(writer: *Io.Writer) !void {
         \\  cvitool build
         \\  cvitool compress [path] [--ext <list>] [--folder <dir>] [--out <file.zip>]
         \\  cvitool upload target.zip targeturl
+        \\  cvitool runtime
         \\  cvitool version
         \\  cvitool help
         \\
@@ -725,6 +737,183 @@ fn runUpload(
             fatal(stderr, "curl 업로드 실패 (exit code {d})", .{code});
         },
         else => fatal(stderr, "curl 업로드 실패", .{}),
+    }
+}
+
+fn runRuntime(io: Io, allocator: std.mem.Allocator, stderr: *Io.Writer) ![]const u8 {
+    try runDownload(io, allocator, stderr, RuntimeUrl, RuntimeZip);
+
+    const zip_abs = try toAbsolutePath(allocator, RuntimeZip);
+    const dest_abs = try toAbsolutePath(allocator, RuntimeFolder);
+
+    runPowerShellExpand(io, allocator, zip_abs, dest_abs) catch |err| switch (err) {
+        error.CommandFailed => fatal(stderr, "압축 해제에 실패했습니다.", .{}),
+        else => return err,
+    };
+
+    const exists = dirExists(io, dest_abs) catch |err| switch (err) {
+        else => return err,
+    };
+    if (!exists) {
+        fatal(stderr, "압축 해제 후 폴더를 찾지 못했습니다: {s}", .{dest_abs});
+    }
+
+    runOpenFolder(io, dest_abs) catch |err| switch (err) {
+        error.FileNotFound => fatal(stderr, "폴더 열기 명령을 찾을 수 없습니다.", .{}),
+        else => return err,
+    };
+
+    return dest_abs;
+}
+
+fn runDownload(
+    io: Io,
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    url: []const u8,
+    out_path: []const u8,
+) !void {
+    var args = [_][]const u8{ "curl", "-L", "-f", "-S", "-o", out_path, url };
+    var child = std.process.spawn(io, .{
+        .argv = &args,
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .create_no_window = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => {
+            runPowerShellDownload(io, allocator, out_path, url) catch |err2| switch (err2) {
+                error.CommandFailed => fatal(stderr, "다운로드 실패", .{}),
+                else => return err2,
+            };
+            return;
+        },
+        else => return err,
+    };
+
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code != 0) {
+            fatal(stderr, "다운로드 실패 (exit code {d})", .{code});
+        },
+        else => fatal(stderr, "다운로드 실패", .{}),
+    }
+}
+
+fn runPowerShellDownload(io: Io, allocator: std.mem.Allocator, out_path: []const u8, url: []const u8) !void {
+    const escaped_out = try escapePsSingleQuoted(allocator, out_path);
+    const escaped_url = try escapePsSingleQuoted(allocator, url);
+
+    var cmd: std.ArrayList(u8) = .empty;
+    try cmd.appendSlice(allocator, "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; ");
+    try cmd.appendSlice(allocator, "Invoke-WebRequest -Uri '");
+    try cmd.appendSlice(allocator, escaped_url);
+    try cmd.appendSlice(allocator, "' -OutFile '");
+    try cmd.appendSlice(allocator, escaped_out);
+    try cmd.appendSlice(allocator, "'");
+
+    const args = [_][]const u8{ "powershell", "-NoProfile", "-Command", cmd.items };
+    var child = std.process.spawn(io, .{
+        .argv = &args,
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .create_no_window = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => {
+            const args_pwsh = [_][]const u8{ "pwsh", "-NoProfile", "-Command", cmd.items };
+            var child_pwsh = try std.process.spawn(io, .{
+                .argv = &args_pwsh,
+                .stdin = .ignore,
+                .stdout = .inherit,
+                .stderr = .inherit,
+                .create_no_window = true,
+            });
+            const term_pwsh = try child_pwsh.wait(io);
+            switch (term_pwsh) {
+                .exited => |code| if (code != 0) return error.CommandFailed,
+                else => return error.CommandFailed,
+            }
+            return;
+        },
+        else => return err,
+    };
+
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
+}
+
+fn runPowerShellExpand(io: Io, allocator: std.mem.Allocator, zip_path: []const u8, dest_path: []const u8) !void {
+    const escaped_zip = try escapePsSingleQuoted(allocator, zip_path);
+    const escaped_dest = try escapePsSingleQuoted(allocator, dest_path);
+
+    var cmd: std.ArrayList(u8) = .empty;
+    try cmd.appendSlice(allocator, "$ErrorActionPreference='Stop'; Expand-Archive -Path '");
+    try cmd.appendSlice(allocator, escaped_zip);
+    try cmd.appendSlice(allocator, "' -DestinationPath '");
+    try cmd.appendSlice(allocator, escaped_dest);
+    try cmd.appendSlice(allocator, "' -Force");
+
+    const args = [_][]const u8{ "powershell", "-NoProfile", "-Command", cmd.items };
+    var child = std.process.spawn(io, .{
+        .argv = &args,
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .create_no_window = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => {
+            const args_pwsh = [_][]const u8{ "pwsh", "-NoProfile", "-Command", cmd.items };
+            var child_pwsh = try std.process.spawn(io, .{
+                .argv = &args_pwsh,
+                .stdin = .ignore,
+                .stdout = .inherit,
+                .stderr = .inherit,
+                .create_no_window = true,
+            });
+            const term_pwsh = try child_pwsh.wait(io);
+            switch (term_pwsh) {
+                .exited => |code| if (code != 0) return error.CommandFailed,
+                else => return error.CommandFailed,
+            }
+            return;
+        },
+        else => return err,
+    };
+
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code != 0) return error.CommandFailed,
+        else => return error.CommandFailed,
+    }
+}
+
+fn runOpenFolder(io: Io, path_value: []const u8) !void {
+    const tag = @import("builtin").os.tag;
+    const args = switch (tag) {
+        .windows => [_][]const u8{ "explorer", path_value },
+        .macos => [_][]const u8{ "open", path_value },
+        else => [_][]const u8{ "xdg-open", path_value },
+    };
+
+    var child = std.process.spawn(io, .{
+        .argv = &args,
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .create_no_window = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => return err,
+    };
+
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code != 0 and tag != .windows) return error.CommandFailed,
+        else => return error.CommandFailed,
     }
 }
 
