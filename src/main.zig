@@ -53,6 +53,13 @@ pub fn main(init: std.process.Init) !void {
 
     const cmd = args[1];
     if (isHelp(cmd)) {
+        if (args.len >= 3) {
+            const target = args[2];
+            if (try printCommandHelp(stdout, target)) {
+                try stdout.flush();
+                return;
+            }
+        }
         try printHelp(stdout);
         try stdout.flush();
         return;
@@ -63,6 +70,13 @@ pub fn main(init: std.process.Init) !void {
         try stdout.print("Repository: {s}\n", .{Repo});
         try stdout.flush();
         return;
+    }
+    if (args.len >= 3 and hasHelpFlag(args[2..])) {
+        if (try printCommandHelp(stdout, cmd)) {
+            try stdout.flush();
+            return;
+        }
+        fatal(stderr, "알 수 없는 명령입니다: {s}", .{cmd});
     }
 
     if (mem.eql(u8, cmd, "bump") or mem.eql(u8, cmd, "update")) {
@@ -150,6 +164,7 @@ fn printHelp(writer: *Io.Writer) !void {
         \\  cvitool runtime
         \\  cvitool version
         \\  cvitool help
+        \\  cvitool <command> --help
         \\
         \\compress 기본값:
         \\  path: src
@@ -173,8 +188,125 @@ fn isHelp(arg: []const u8) bool {
     return mem.eql(u8, arg, "help") or mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help");
 }
 
+fn hasHelpFlag(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (isHelp(arg)) return true;
+    }
+    return false;
+}
+
 fn isVersion(arg: []const u8) bool {
     return mem.eql(u8, arg, "version") or mem.eql(u8, arg, "--version") or mem.eql(u8, arg, "-V");
+}
+
+fn printCommandHelp(writer: *Io.Writer, cmd: []const u8) !bool {
+    if (mem.eql(u8, cmd, "bump") or mem.eql(u8, cmd, "update")) {
+        try writer.writeAll(
+            \\사용법:
+            \\  cvitool bump 1.2.3.4
+            \\  cvitool update 1.2.3.4
+            \\
+            \\설명:
+            \\  현재 폴더부터 .prj 파일을 탐색해 유일한 1개를 찾고,
+            \\  아래 항목을 지정한 버전으로 변경합니다.
+            \\    Numeric File Version = "1.2.3.4"
+            \\    Numeric Prod Version = "1.2.3.4"
+            \\
+        );
+        return true;
+    }
+
+    if (mem.eql(u8, cmd, "build")) {
+        try writer.writeAll(
+            \\사용법:
+            \\  cvitool build
+            \\
+            \\설명:
+            \\  compile 명령이 존재하는지 확인한 뒤,
+            \\  compile <찾아낸 파일>.prj 를 실행합니다.
+            \\
+        );
+        return true;
+    }
+
+    if (mem.eql(u8, cmd, "compress")) {
+        try writer.writeAll(
+            \\사용법:
+            \\  cvitool compress [path] [--ext <list>] [--folder <dir>] [--out <file.zip>]
+            \\
+            \\옵션:
+            \\  --path, -p    기준 경로 (기본: src)
+            \\  --ext, -e     확장자 목록 (기본: dll, uir, exe, ini)
+            \\  --folder, -d  포함할 폴더(여러 개 가능)
+            \\  --out, -o     출력 zip 파일명
+            \\
+            \\기본값:
+            \\  path: src
+            \\  ext:  *.dll *.uir *.exe *.ini
+            \\  folder: 없음 (루트 폴더를 포함하지 않음, 여러 개 가능)
+            \\  path를 지정하고 folder를 생략하면 res 폴더를 기본 포함 (존재할 때)
+            \\  out: <시간>_<폴더이름>.zip
+            \\
+            \\예시:
+            \\  cvitool compress
+            \\  cvitool compress dist --ext dll,exe --out release.zip
+            \\  cvitool compress src --folder bin
+            \\
+        );
+        return true;
+    }
+
+    if (mem.eql(u8, cmd, "upload")) {
+        try writer.writeAll(
+            \\사용법:
+            \\  cvitool upload target.zip targeturl
+            \\
+            \\설명:
+            \\  .env의 CURL_ARGS 또는 CVITOOL_CURL_ARGS 값을 curl 옵션으로 사용합니다.
+            \\
+        );
+        return true;
+    }
+
+    if (mem.eql(u8, cmd, "runtime")) {
+        try writer.writeAll(
+            \\사용법:
+            \\  cvitool runtime
+            \\
+            \\설명:
+            \\  cvi runtime을 다운로드하고 현재 폴더에 압축 해제한 뒤 폴더를 엽니다.
+            \\  URL: https://download.ni.com/support/softlib/labwindows/cvi/Run-Time%20Engines/2013/NILWCVIRTE2013.zip
+            \\
+        );
+        return true;
+    }
+
+    if (isVersion(cmd)) {
+        try writer.writeAll(
+            \\사용법:
+            \\  cvitool version
+            \\
+            \\설명:
+            \\  버전, 개발자, 저장소 정보를 출력합니다.
+            \\
+        );
+        return true;
+    }
+
+    if (isHelp(cmd)) {
+        try writer.writeAll(
+            \\사용법:
+            \\  cvitool help
+            \\  cvitool help <command>
+            \\
+            \\설명:
+            \\  전체 도움말 또는 특정 명령 도움말을 출력합니다.
+            \\
+        );
+        return true;
+    }
+
+    return false;
 }
 
 fn isValidVersion(version: []const u8) bool {
