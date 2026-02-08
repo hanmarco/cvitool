@@ -773,31 +773,9 @@ fn runDownload(
     url: []const u8,
     out_path: []const u8,
 ) !void {
-    var args = [_][]const u8{ "curl", "-L", "-f", "-S", "-o", out_path, url };
-    var child = std.process.spawn(io, .{
-        .argv = &args,
-        .stdin = .ignore,
-        .stdout = .inherit,
-        .stderr = .inherit,
-        .create_no_window = true,
-    }) catch |err| switch (err) {
-        error.FileNotFound => {
-            runPowerShellDownload(io, allocator, out_path, url) catch |err2| switch (err2) {
-                error.CommandFailed => fatal(stderr, "다운로드 실패", .{}),
-                else => return err2,
-            };
-            return;
-        },
-        else => return err,
+    downloadWithProgress(io, allocator, stderr, url, out_path) catch |err| {
+        fatal(stderr, "다운로드 실패: {s}", .{@errorName(err)});
     };
-
-    const term = try child.wait(io);
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            fatal(stderr, "다운로드 실패 (exit code {d})", .{code});
-        },
-        else => fatal(stderr, "다운로드 실패", .{}),
-    }
 }
 
 fn runPowerShellDownload(io: Io, allocator: std.mem.Allocator, out_path: []const u8, url: []const u8) !void {
@@ -805,7 +783,7 @@ fn runPowerShellDownload(io: Io, allocator: std.mem.Allocator, out_path: []const
     const escaped_url = try escapePsSingleQuoted(allocator, url);
 
     var cmd: std.ArrayList(u8) = .empty;
-    try cmd.appendSlice(allocator, "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; ");
+    try cmd.appendSlice(allocator, "$ErrorActionPreference='Stop'; $ProgressPreference='Continue'; ");
     try cmd.appendSlice(allocator, "Invoke-WebRequest -Uri '");
     try cmd.appendSlice(allocator, escaped_url);
     try cmd.appendSlice(allocator, "' -OutFile '");
@@ -844,6 +822,179 @@ fn runPowerShellDownload(io: Io, allocator: std.mem.Allocator, out_path: []const
         .exited => |code| if (code != 0) return error.CommandFailed,
         else => return error.CommandFailed,
     }
+}
+
+fn downloadWithProgress(
+    io: Io,
+    allocator: std.mem.Allocator,
+    stderr: *Io.Writer,
+    url: []const u8,
+    out_path: []const u8,
+) !void {
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(url);
+    var req = try client.request(.GET, uri, .{
+        .redirect_behavior = std.http.Client.Request.RedirectBehavior.init(5),
+        .headers = .{
+            .accept_encoding = .{ .override = "identity" },
+        },
+    });
+    defer req.deinit();
+
+    var accept = req.accept_encoding;
+    accept = @splat(false);
+    accept[@intFromEnum(std.http.ContentEncoding.identity)] = true;
+    req.accept_encoding = accept;
+
+    try req.sendBodiless();
+
+    var redirect_buffer: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buffer);
+    if (response.head.status.class() != .success) {
+        fatal(stderr, "다운로드 실패 (HTTP {d} {s})", .{
+            @intFromEnum(response.head.status),
+            response.head.reason,
+        });
+    }
+
+    const file = try Io.Dir.cwd().createFile(io, out_path, .{ .truncate = true });
+    defer file.close(io);
+
+    var file_buffer: [16 * 1024]u8 = undefined;
+    var file_writer = file.writer(io, &file_buffer);
+
+    var transfer_buffer: [16 * 1024]u8 = undefined;
+    var reader = response.reader(&transfer_buffer);
+
+    var progress = Progress.init(response.head.content_length);
+    try progress.render(stderr, false);
+
+    var read_buffer: [32 * 1024]u8 = undefined;
+    while (true) {
+        const n = reader.readSliceShort(&read_buffer) catch |err| switch (err) {
+            error.ReadFailed => {
+                if (response.bodyErr()) |body_err| return body_err;
+                return err;
+            },
+        };
+        if (n == 0) break;
+
+        file_writer.interface.writeAll(read_buffer[0..n]) catch return error.WriteFailedFile;
+        progress.update(n);
+        if (progress.shouldRender()) {
+            try progress.render(stderr, false);
+        }
+    }
+    try file_writer.flush();
+
+    progress.forceComplete();
+    try progress.render(stderr, true);
+}
+
+const Progress = struct {
+    total: ?u64,
+    downloaded: u64 = 0,
+    last_render_bytes: u64 = 0,
+    last_render_time: ?std.time.Instant = null,
+
+    fn init(total: ?u64) Progress {
+        return .{
+            .total = total,
+            .last_render_time = std.time.Instant.now() catch null,
+        };
+    }
+
+    fn update(self: *Progress, delta: usize) void {
+        self.downloaded += delta;
+    }
+
+    fn forceComplete(self: *Progress) void {
+        if (self.total) |total| {
+            if (self.downloaded < total) {
+                self.downloaded = total;
+            }
+        }
+    }
+
+    fn shouldRender(self: *Progress) bool {
+        if (self.downloaded - self.last_render_bytes >= 256 * 1024) return true;
+        if (self.last_render_time) |last| {
+            const now = std.time.Instant.now() catch return false;
+            if (now.since(last) >= 200 * std.time.ns_per_ms) {
+                self.last_render_time = now;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn render(self: *Progress, writer: *Io.Writer, final: bool) !void {
+        var line_buf: [256]u8 = undefined;
+        if (self.total) |total| {
+            const width: usize = 30;
+            const filled = if (total == 0) 0 else @min(
+                @as(u64, width),
+                @as(u64, @intCast((@as(u128, self.downloaded) * @as(u128, width)) / total)),
+            );
+            const filled_usize: usize = @intCast(filled);
+            var bar: [30]u8 = undefined;
+            var i: usize = 0;
+            while (i < bar.len) : (i += 1) {
+                bar[i] = if (i < filled_usize) '#' else '-';
+            }
+
+            const pct = if (total == 0) 0 else @min(@as(u64, 100), @as(u64, @intCast((@as(u128, self.downloaded) * 100) / total)));
+
+            var dl_buf: [32]u8 = undefined;
+            var total_buf: [32]u8 = undefined;
+            const dl_str = try formatBytes(&dl_buf, self.downloaded);
+            const total_str = try formatBytes(&total_buf, total);
+
+            const line = try std.fmt.bufPrint(&line_buf, "\rDownloading [{s}] {d:3}% {s}/{s}", .{
+                bar[0..],
+                pct,
+                dl_str,
+                total_str,
+            });
+            try writer.writeAll(line);
+        } else {
+            var dl_buf: [32]u8 = undefined;
+            const dl_str = try formatBytes(&dl_buf, self.downloaded);
+            const line = try std.fmt.bufPrint(&line_buf, "\rDownloading {s}", .{dl_str});
+            try writer.writeAll(line);
+        }
+        if (final) {
+            try writer.writeAll("\n");
+        }
+        try writer.flush();
+
+        self.last_render_bytes = self.downloaded;
+        if (self.last_render_time != null) {
+            self.last_render_time = std.time.Instant.now() catch self.last_render_time;
+        }
+    }
+};
+
+fn formatBytes(buf: []u8, value: u64) ![]const u8 {
+    const units = [_][]const u8{ "B", "KB", "MB", "GB", "TB" };
+    var v = @as(f64, @floatFromInt(value));
+    var unit: usize = 0;
+    while (v >= 1024.0 and unit + 1 < units.len) : (unit += 1) {
+        v /= 1024.0;
+    }
+
+    if (unit == 0) {
+        return std.fmt.bufPrint(buf, "{d}{s}", .{ value, units[unit] });
+    }
+    if (v >= 10.0) {
+        return std.fmt.bufPrint(buf, "{d:.0}{s}", .{ v, units[unit] });
+    }
+    return std.fmt.bufPrint(buf, "{d:.1}{s}", .{ v, units[unit] });
 }
 
 fn runPowerShellExpand(io: Io, allocator: std.mem.Allocator, zip_path: []const u8, dest_path: []const u8) !void {
