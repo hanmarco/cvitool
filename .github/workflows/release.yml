@@ -10,18 +10,12 @@ permissions:
 
 jobs:
   build:
-    runs-on: [self-hosted, windows]
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure Zig
-        shell: powershell
-        run: |
-          if (-not (Get-Command zig -ErrorAction SilentlyContinue)) {
-            Write-Error "zig not found on PATH. Install Zig on the self-hosted runner."
-            exit 1
-          }
-          zig version
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
 
       - name: Build
         shell: powershell
